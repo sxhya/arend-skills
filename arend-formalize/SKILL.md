@@ -49,6 +49,8 @@ Goal: figure out whether the prerequisites already exist, whether someone has al
 
 2. **When you do open a source file, read the signature, not the body.** Definitions in arend-lib are signature-first: the `\func` / `\lemma` / `\class` line plus its result type is what you need to decide whether something applies. Bodies are large, meta-heavy, and rarely relevant to an existence question — skip past them.
 
+   **Exception — scout the idiom before extending an existing module.** Once you know *which* module you are adding to, read the bodies of the three or four nearest existing definitions and write down how they are *proved*, not what they are called. No name you can guess will tell you "this module reasons via `AbMonoid.FinSum` over `SigmaFin`/`PairsFinSet`, not via `BigSum` over `\new Array`" — and picking the wrong one costs an order of magnitude in proof length that no later cleanup recovers. This is the one place where reading bodies is the cheap move.
+
 3. **For name-pattern lookup, use `arend -ss <pattern>` (symbol-search).** Fast, cached on-disk index. Becomes more useful as you internalize arend-lib's naming conventions (e.g., `+-comm`, `*-assoc`, `inv-r`, `iso->equiv`).
 
    **Default is case-insensitive substring on short names — *not* regex.** Reaching for `.*` or `\|` means you guessed wrong:
@@ -100,11 +102,84 @@ Goal: a typechecking file where the only remaining errors are the `{?}`s represe
 5. **Capture knowledge as you go.**
    - If you learned a *language-level* fact (a quirk, a syntax surprise, a typing rule that bit you), add it to `~/.claude/skills/arend-quirks/SKILL.md`.
    - If you learned a *meta-level* fact (a failure mode, a non-obvious meta interaction), add it to `~/.claude/skills/arend-prove/SKILL.md`.
-   - If something was **cumbersome, slow, or painful** in a way that feels like a *tooling* issue rather than your mistake (typechecker quirk, slow/misleading CLI behavior, confusing diagnostic), append it to `arend-issues.md` at the repo root — `/home/sergey/Documents/Arend/arend-issues.md`. Note that this file **does not currently exist**: it was deleted on 2026-05-21 in commit `f0c5f9dbf` "Remove issues/blueprint" (699 lines, alongside `cos-pi-blueprint.md`), so its old numbered entries are gone and nothing should cite them. Recreate it only if the user wants the log resumed — ask before reintroducing a file they deliberately removed. **Do not** log missing library statements here — a missing lemma is not an issue, it's something to add. If a helper is missing from arend-lib, put it in the right module and move on.
+   - If something was **cumbersome, slow, or painful** in a way that feels like a *tooling* issue rather than your mistake (typechecker quirk, slow/misleading CLI behavior, confusing diagnostic), append it to `arend-issues.md` at the repo root — `/home/sergey/Documents/Arend/arend-issues.md`. The file was deleted on 2026-05-21 (`f0c5f9dbf`) and **recreated on 2026-08-03** at the user's request to hold CLI/typechecker feature requests; its old numbered entries are gone, so never cite "`arend-issues.md` #N". **Do not** log missing library statements here — a missing lemma is not an issue, it's something to add. If a helper is missing from arend-lib, put it in the right module and move on.
 
 6. **Done when the only remaining errors are `GOAL` (unproven `{?}`s).** Type-mismatch, unresolved-reference, universe-level, and termination errors must all be gone. If any non-GOAL error remains, you're not done.
 
 7. **Re-read the final statement against the informal claim.** Variable order, implicit/explicit splits, universe levels, and class parameters all change meaning. The Arend statement that typechecks is not necessarily the formalization of what you were given — verify by hand.
+
+---
+
+## Phase 4 — the finish checklist
+
+**Execute this as a pass, with the diff open, item by item. Do not run it from memory.** Every item below was violated in work that had this skill loaded, so recall is not the failure mode; execution is. Groups 5 and 7 are *experiments*: make the edit, re-typecheck, and put it back only if the typechecker objects.
+
+*Provenance: the two "Refactor AI slop" reviews — `85817d37` (2026-06-16, 43 files, −3270/+2297) and `0e2fc701` (2026-07-31) — consist almost entirely of these eight groups.*
+
+### 1. Goals and dead code
+- `grep -n '{?}'` over every file touched. A `{?}` must never reach a commit.
+- `-fu` every new definition. `No usages.` → delete it.
+- No lemma whose body is `idp`; no `pmap f idp` step; no lemma that is a partial application of another (`f a b 0`).
+
+### 2. Naming — check every new name against this table
+
+| Kind | Convention | Right | Wrong |
+|---|---|---|---|
+| `\Prop`/`\Type`-valued predicate or index family | Capitalised | `OnUnitCircle`, `DyadicShift`, `IsCentral` | `onUnitCircle`, `dyadic-shift` |
+| "f commutes with g" | `f_g`, underscore | `fromReal_pow`, `conv_fromRat` | `fromReal-pow`, `fromRat-conv` |
+| adjectival / qualified variant | `f-adj`, hyphen | `abs-square`, `pow_<=-degree` | — |
+| coefficient | `coef` | `compose-coef`, `coef-Rat` | `coeff` |
+| one of a directional pair | direction in the name | `exp_negative-left` / `-right` | `exp_negative` |
+| abbreviation | spell it out | `square` | `sq` |
+
+Also: no proof-plan labels in names or doc comments (`L1:`, `Step 3:`, `Main theorem:`); no file-local `\alias` for a function used fewer than ~10 times — use `\open M \using (Long \as short)`.
+
+### 3. Comments — delete on sight
+- Any comment that restates the signature in words.
+- Any comment documenting *your* workaround ("stated over an array variable so the implicits infer"; "naming it keeps `pmap` from guessing").
+- Any proof sketch duplicating the body, and any `-- Step N` marker inside a body.
+- Any comment narrating the file organisation ("supporting material lives with its subject matter").
+- Any `TODO: hoist to X` / `TODO: belongs in \where of X` — do the move now, it is two lines.
+
+Then: every surviving comment that asserts a mathematical necessity ("needs commutativity", "not cancellative at ∞") must be one you can defend. Two of mine were false.
+
+### 4. Placement
+- Exactly one consumer (`-fu`) → move into that consumer's `\where`.
+- Takes `{X : SomeClass}` and is only ever used at `X` → make it a member of the class.
+- `\where`-nested and needed by a sibling → drop `\private` or hoist to file level (**arend-quirks** §18).
+- Directory matches subject. A real-analysis statement does not live under `Algebra/Field/`.
+- No import from a higher layer: nothing under `Algebra/` imports `Analysis/` or `Topology/`. If you needed a type from there, define the algebraic one locally.
+- Delete every import no longer used.
+
+### 5. Hypotheses — try to weaken every one
+The check nobody performs by reflex, and the source of the mathematically wrong signatures.
+- Each explicit hypothesis: delete it, re-typecheck.
+- Each class parameter: replace by each superclass (`-ch <class>` lists them), re-typecheck. Real instances: `CompleteExNormedRing` → `ExPseudoNormedRing` (7 lemmas), `OrderedCRing` → `LinearlyOrderedSemiring`, `BanachAlgebra` → `QAlgebra`.
+- `Fin n` in a statement → try `{A : FinSet}`. Stated at `Fin n` it will not apply to `PairsFinSet` / `SigmaFin` / `ProdFin`, and you will re-prove it by hand.
+- `\Pi (y z : A) -> y * z = z * y` is almost always too strong: the statement usually needs one element central (`Monoid.IsCentral`).
+- Any argument that is a proposition and gets `prop-pi`'d downstream → mark `\property`.
+
+### 6. Abstraction by repetition
+- A hypothesis appearing in ≥3 signatures of this diff → name it.
+- A class combination appearing in ≥3 signatures → declare the class. (`\class RealBanachCAlgebra \extends RealBanachAlgebra, CRing` is one line and deleted ten `*-comm` arguments.)
+- Two definitions differing only in a constant → generalise one, delete the other.
+
+### 7. Redundancy — omit and re-typecheck
+- Every explicit implicit `{…}`.
+- Every type ascription `(meta : T)` — let the chain position pin the type.
+- Every `\lam (x : T) =>` binder annotation.
+- `\new Array A n (\lam i => e)` → `\lam i => e`.
+- **Qualification: `C.f {inst} args` → `inst.f args`.** Qualify with the *instance*, never with the defining class carrying the instance as an implicit. `RealField.pow x n`, not `pow {RealField} x n`. This one alone accounts for hundreds of tokens per file.
+- `\lam x => f x + e` → `` (`+ e) ``; `transport (\lam x => P x) (inv p)` → `transportInv P p`.
+- Hand-stepped `\have` chains where `simplify` / `equation.cRing` / `linarith` closes the goal outright.
+- Hand-written `\case d \as d \return (\case d \with {…}) = …` motives → `mcases \with {…}`.
+- `\case e \with { | inP (…) => body }` → `\let | (inP (…)) => e \in body`.
+
+### 8. Layout
+- Signature: parameters, then `: Result` on its own line, then `=> body`. Never `… (args) :` at end of line.
+- `\where {` on its own line, members indented one level.
+- `\have` for proofs, `\let` for values.
+- `Record R`, not `Record { | R => R }`; `| Parent => …` to reuse a parent instance rather than re-implementing its fields.
 
 ---
 
@@ -168,17 +243,14 @@ Safety nets: a plain pattern containing a regex *sequence* (`.*`, `.+`, `.?`, `(
 
 ## Style and refactoring
 
-Once your file reaches "only GOAL remaining", run a compaction pass before declaring it done — otherwise the proof will be rewritten in review. The patterns to apply:
+The compaction patterns now live in **Phase 4** above and are meant to be executed there, not recalled. Two that don't fit a checklist item:
 
-- delete idp-bodied lemmas and `pmap f idp` steps;
-- inline single-use helpers and single-use `\have` clauses;
-- replace hand-stepped `\have` chains with `simplify` / `equation.cRing` / `linarith`;
-- use slot notation (`` `<∘ bound ``, `__ + 1`) and `$` to flatten nesting;
-- migrate helpers into `\where` where they belong to one parent;
 - hoist repeated explicit embeddings to `\use \coerce` (see **arend-quirks** §10);
 - prefer `-- |` doc comments over `{- | … -}` for one-liners (see **arend-quirks** §19 for why LaTeX in block comments is hazardous).
 
-There was once a separate `arend-refactor` skill holding the worked examples for these. Its `SKILL.md` had been overwritten with a copy of `arend-error-extraneous-input`, so it was removed on 2026-07-28 and the list above is what survives. Treat these as the target style *while writing*, not only on a post-pass.
+Treat all of it as the target style *while writing*; Phase 4 is the backstop, not the plan.
+
+(There was once a separate `arend-refactor` skill holding worked examples. Its `SKILL.md` had been overwritten with a copy of `arend-error-extraneous-input`, so it was removed on 2026-07-28.)
 
 ---
 
@@ -189,3 +261,5 @@ There was once a separate `arend-refactor` skill holding the worked examples for
 - **Writing the statement first, then deciding which class to parameterize over.** That decision should come out of `-ch` in phase 2, not from staring at the goal.
 - **Chasing type errors while unresolved references remain.** Resolution and typechecking share one pass, so an unresolved name poisons every type downstream of it. Clear all `Cannot resolve reference` errors first, then re-read what's left — much of it will be gone.
 - **Treating a typechecking statement as "done" without re-reading it against the informal claim.** Step 7 of phase 3 is non-negotiable — typechecking proves consistency, not faithfulness.
+- **Skipping Phase 4 because the code typechecks.** Typechecking is the entry condition for Phase 4, not a substitute for it. The two review commits that motivated the checklist deleted ~1000 net lines of typechecking code.
+- **Re-reading the Phase 4 list instead of running it.** Several of its items were already written down elsewhere in this skill set when they were violated. The list is only worth anything as an executed pass with a re-typecheck after each group.

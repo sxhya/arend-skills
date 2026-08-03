@@ -161,6 +161,20 @@ The names `Algebra.Meta`, `Paths.Meta`, `Meta`, `Function.Meta` are *virtual* (p
 
     *Heavier alternative (avoid unless the empty-import idiom can't apply):* mirror the `Arith/Log.ard` (generic) + `Arith/Log/Real.ard` (Real-specific) split — move the `RealStoneC*Algebra`-needing definitions into a base module that imports `StoneCStarAlgebra`, and import *that* base (not `StoneCStarAlgebra`) into the arithmetic file. Arend imports are non-transitive, so the instance stays out of the consumer's scope.
 
+15. **`rewrite` searches the goal *syntactically*; it does not reduce the goal to expose a pattern.** Unification (`*>` chains, argument positions) normalizes, `rewrite`'s subexpression search does not. So a step whose LHS only appears *after* a reduction fails with `Cannot find subexpression`, even though the same lemma works fine as a chain element. Concretely, `BigSum (\new Array M 1 (f __))` reduces to `f 0 + 0` under unification, so `zro-right *> ide-right` typechecks against it — but `rewrite zro-right` reports
+
+        Cannot find subexpression: {?error} + zro {{?error}}
+           Expression: BigSum {…} (\new Array Complex 1 (\lam p0 => …)) + BigSum … = b 0
+
+    Same for `pow x 0 → ide` and `pow z (suc k) → pow z k * z`. **Rule: when the pattern needs the goal to reduce first, write the step as a `*>`/`pmap` chain instead of a `rewrite`.**
+
+16. **Concrete `Complex` (any record whose ring operations compute on fields) defeats both `equation.cRing` and `rewrite`.** `ComplexField.*` / `.+` unfold to `\new Complex (x.re * y.re - x.im * y.im) (…)` as soon as one operand is concrete, so:
+
+    - `equation.cRing` on a `Complex` identity fails — the solver normalizes into `re`/`im` components and reports two unequal component-wise expressions (`v0 = …`, `v1 = …` full of `.re`/`.im`). Verified 2026-07-29: even `\lemma p {x y : Complex} : x * y = y * x => equation.cRing` fails. **Fix: state the algebraic step over an abstract `{C : CRing}` and instantiate it at `ComplexField`** — that is what the `cring-*` helpers in `Algebra/Field/FTA.ard` (`opposite-direction \where`) exist for; they are load-bearing, not scaffolding. Give the helper a hypothesis (`(h : x * z = negative (e * y))`) so one lemma covers a whole rearrange-and-substitute step.
+    - A meta *inside* a concrete-`Complex` operation is unsolvable: matching `cabs (?x * ?y)` against `cabs (b i * pow z i)` becomes higher-order once `*` unfolds, so `cabs_*`, `cabs_+`, `cabs_negative` need their implicits spelled out (`cabs_* {b i} {pow z i}`) — or, better, the operands must be *variables*, i.e. parameters of a helper lemma (`dir-cabs (b0 bk : Complex) (t : Real)`). Metas in **bare** positions are fine: in `cabs_+3 (X : Complex) {Y Z : Complex} … : cabs (X + (Y + Z)) <= cabs X + (y + z)`, `Y`/`Z` are inferred from the two bound arguments' types, but `X` had to be made explicit because its only other occurrence is under the `+`.
+
+17. **`rewrite zro_*-left` / `zro_*-right` over `Real` can misfire.** `zro * x` normalizes to `fromRat zro`, so the pattern that gets searched is not the one you wrote and the rewrite can hit the wrong side (symptom: an argument's expected type collapses to `zro < fromRat zro`). Use `transportInv (\`< <the other side>) zro_*-left h` there — the explicit motive says exactly which occurrence to abstract.
+
 ### Workflow and language gotchas
 
 - **`\peval` is for `\sfunc` only.** Plain `\func`s reduce by definition; `\peval` on them errors with `Expected a function or an \scase expression`.
@@ -598,7 +612,7 @@ Apply these while writing, not only on a post-pass:
 
 Anything that felt unreasonable about the **tooling** — surprising typechecker errors, instance inference that should "just work", misleading diagnostics, slow CLI paths — goes to `arend-issues.md` at the repo root (`/home/sergey/Documents/Arend/arend-issues.md`) with a one-liner on where it bit you. Future you needs the trail.
 
-**State of that file as of 2026-07-28: it does not exist.** It was deleted on 2026-05-21 in commit `f0c5f9dbf` "Remove issues/blueprint" (699 lines, together with `cos-pi-blueprint.md`). Its old numbered entries are gone, so never cite "`arend-issues.md` #N". Ask before recreating a file the user deliberately removed.
+**State of that file: deleted 2026-05-21 (`f0c5f9dbf`, "Remove issues/blueprint"), recreated 2026-08-03** at the user's request to hold CLI/typechecker feature requests derived from the two "Refactor AI slop" reviews. Its old numbered entries are gone, so never cite "`arend-issues.md` #N" — append new entries instead.
 
 **Missing library statements do not belong here.** A gap in arend-lib is a contribution opportunity, not a complaint to file: add the helper directly to the appropriate module. `arend-issues.md` is for things the agent *cannot* fix by editing arend-lib — tooling and language-level friction.
 
