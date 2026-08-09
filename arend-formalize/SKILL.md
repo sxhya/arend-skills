@@ -12,30 +12,74 @@ For language-level surprises while writing the statement, see the **arend-quirks
 
 ---
 
-## Phase 0 — Turn on `--serialize`
+## Phase 0 — Start the daemon
 
-**Serialization is opt-in** (commit `9a59b3151`, 2026-05-15). Without `--serialize`, typechecking runs but **no `.arc` files are written** — so every invocation re-typechecks arend-lib from source (~2 min cold), and nothing you do makes the next run any faster. Pass it on every typechecking invocation:
+> **Flag change (CLI 1.12).** `--serialize` **no longer exists** — passing it fails with `Unrecognized option: --serialize`. Serialization is now **on by default** and `--no-serialize` is the opt-out. Everything below reflects the current CLI; older notes telling you to pass `--serialize` on every call are stale.
+
+The edit loop is dominated by JVM startup and library load, not by typechecking your edit. The fix is the **daemon**: a long-lived JVM holding a warm `ArendServer`. Start it once per session:
 
 ```bash
-cd /home/sergey/Documents/Arend/arend-lib && arend --serialize <Module>
+cd /Users/sergey.sinchuk/Documents/Arend/arend-lib && arend . -d
 ```
 
-The first run pays the full cost and persists the caches; subsequent runs deserialize the unchanged cone and only re-typecheck what you edited — seconds instead of minutes. That difference is the whole edit loop, so make `--serialize` the default on every typecheck, not something you remember occasionally.
+Bootstrap does the full `load + typecheck + persist + ai-finalize` once, then idles. **Every subsequent `arend` call in that library auto-routes to it** — no flag needed on the client side — so a scoped typecheck comes back in seconds instead of minutes.
 
-Read and write are separate switches:
+| Command | Effect |
+|---|---|
+| `arend . -d` | start the daemon (needs a `LIBRARY` anchored to an `arend.yaml`, or `-s <dir>` for a synthetic library) |
+| `arend . --daemon-ping` | `IDLE` or `BUSY`; `[ERROR] ping: no daemon running…` if there is none |
+| `arend . --daemon-status` | dump state |
+| `arend . --daemon-refresh` | re-run the `-ai` bootstrap on the warm context so source edits are picked up |
+| `arend . --daemon-stop` | stop it |
+| `arend … --no-daemon` | force in-process execution for this one call |
+
+### Flags the daemon eats
+
+This is the part that bites. On a daemon-served call these are **parsed but silently ignored**, locked to the daemon's bootstrap values:
+
+```
+-L   -s   -e   -m   -c   -r   --no-serialize   --slow-warn
+```
+
+`-r` being in that list is the consequential one: **a plain `arend -r <Module>` against a live daemon does not recompile anything.** To actually force a from-source pass you must either add `--no-daemon`, or `--daemon-stop` first.
+
+These are rejected outright inside a daemon-served command (not ignored — hard error): `-i`, `-d`, `--daemon-stop`, `--daemon-ping`, `--daemon-status`, `--daemon-refresh`.
+
+### Binary caches (`.arc`) under the current CLI
 
 | | Behaviour |
 |---|---|
-| **Loading** existing `.arc` | On by default. No flag needed. `-r` / `--recompile` turns it *off* for one run. |
-| **Writing** `.arc` after typecheck | Off by default. `--serialize` turns it *on*. |
+| **Loading** existing `.arc` | On by default. `-r` / `--recompile` turns it off for one run — *but see the daemon-eats-`-r` note above*. |
+| **Writing** `.arc` after typecheck | **On by default.** `--no-serialize` turns it off. |
 
-**Drop `--serialize` when the cache itself is the suspect.** Persisted caches are the mechanism behind the phantom-error failure mode: after a class-hierarchy refactor, cached expressions referencing the old internal terms still deserialize cleanly and report errors that don't exist in the sources. Symptoms:
+**When the cache itself is the suspect.** After a class-hierarchy refactor, cached expressions referencing the old internal terms still deserialize cleanly and report errors that don't exist in the sources. Symptoms:
 
 - Bogus type mismatches naming what looks like the same type twice (`Rat` vs `Arith.Rat.Rat`).
 - Errors on definitions you never touched, which vanish under `-r`.
 - A Java stack trace out of the (de)serializer rather than a typecheck diagnostic.
 
-Recover with **`arend -r --serialize <Module>`**, not bare `-r`. `-r` only skips *loading* the caches (`BinaryLoader.setRecompile(true)`); it does not delete the `.arc` files on disk. So `-r` alone gives you one clean run while leaving the poisoned caches in place for the next plain invocation to load again. Pairing it with `--serialize` overwrites them from the clean build. Once the tree is green, stay on `--serialize` — don't leave it off permanently to dodge a cache bug, or you forfeit the entire speedup.
+Recover with **`arend --no-daemon -r <Module>`**. Both parts matter: `--no-daemon` because a daemon-served `-r` is a no-op, and `-r` because it skips *loading* the caches. Serialization being on by default means the clean build overwrites the poisoned `.arc` on the way out, so one run is enough — the old `-r --serialize` pairing is obsolete.
+
+### The daemon has its own failure mode: poisoning
+
+A resolution error during a daemon run can leave the warm server in a state where importers deny a definition that is plainly visible in the sources. **In-daemon `-r` does not recover it** (it's ignored — see above); neither does `--daemon-refresh` reliably. The only reliable fix is:
+
+```bash
+arend . --daemon-stop && arend . -d
+```
+
+Related, and now fixed: the daemon used to report stored resolver errors only on the *first* run, so a warm re-run of a still-broken module could exit 0 with no diagnostics (arend-lang/Arend#138, fixed 2026-08-08). On a current build, warm-run exit codes are trustworthy again and errors print after the banner. If you are on an older build and a warm run looks suspiciously clean, re-check with `--no-daemon`.
+
+### `-ai` — the agent-oriented pipeline
+
+The daemon's bootstrap *is* `-ai`, and `--daemon-refresh` re-runs it. Standalone: `arend . -ai [MODULE[:DEF]]`. Four stages:
+
+1. **Name resolution (suggest-only)** — for each unresolved short name, prints a `Candidates for 'X' at …` block with each candidate's `library::module:longName`, the qualified name to splice in, and the required import. It never rewrites your sources; you paste the pick yourself.
+2. **Typecheck** of the in-scope modules.
+3. **Signature mirror** — writes signature-only views of every typechecked module to `<library>/.sig/<module>.ard`, with bodies and field implementations replaced by `{?}`. Definitions with typecheck errors become `-- skipped: <name> (typecheck errors)`, so **`.sig/` only ever contains verified declarations** — that is what makes it safe to read as ground truth.
+4. **Symbol index refresh** — rebuilds the on-disk index behind `-ss` / `-fu` / `-ch` / `-sc`.
+
+Output is quiet by default (verbose narration goes to a per-invocation log); `--no-quiet` puts it back on stdout.
 
 **Run every call from inside the library directory.** `cd arend-lib` first: the typecheck workflows and the retrieval flags (`-ss`, `-ps`, `-fu`, `-ch`, `-sc`) all expect the library in scope, and invoking them from the parent dir crashes with `NullPointerException: ctx.outputRouter is null` instead of a clean "no library in scope" error.
 
@@ -89,11 +133,11 @@ Goal: a typechecking file where the only remaining errors are the `{?}`s represe
 
 2. **Typecheck.** The default workflow — no flag, just a positional target. Narrow the scope with the positional to keep the output readable:
 
-   - `arend --serialize` (no target) — the whole library.
-   - `arend --serialize <Module>` — that module and its cone.
-   - `arend --serialize <Module>:<def>` — one definition.
+   - `arend .` (no target) — the whole library.
+   - `arend . <Module>` — that module and its cone.
+   - `arend . <Module>:<def>` — one definition.
 
-   Resolution and typechecking happen in the same pass, so unresolved references surface as `[ERROR]` alongside genuine type errors. Existing `.arc` caches load unless `-r` is also passed; fresh caches are written back only if `--serialize` is passed (see phase 0 — keep it on). Reach for `-r` only when the binaries are out of sync, typically after a class refactor, and pair it with `--serialize` so the poisoned caches get replaced rather than merely skipped.
+   With a daemon up (phase 0) these route to it automatically and return in seconds. Resolution and typechecking happen in the same pass, so unresolved references surface as `[ERROR]` alongside genuine type errors. Existing `.arc` caches load unless `-r` is passed, and fresh ones are written back by default. Reach for `-r` only when the binaries are out of sync, typically after a class refactor — and remember it needs `--no-daemon` to have any effect.
 
 3. **Fix unresolved references by hand.** For each `Cannot resolve reference 'X'`, find the owner with `arend -ss X` — the result is qualified, so it tells you both the name to write and the module to `\import`. When several modules define the same short name, `arend -sc <referable>` dumps the ambient scope at that position and shows which one is actually visible.
 
@@ -187,7 +231,7 @@ The check nobody performs by reflex, and the source of the mathematically wrong 
 
 ### "The lemma is `[GOAL]` but I didn't write `{?}` in the body"
 
-Look upstream, not at the reported def. A `[GOAL]` on a body you wrote in full usually means an *earlier* definition failed to typecheck, and the reference to it degraded into a hole. Re-run scoped to the whole module (`arend --serialize <Module>`) rather than the one definition, and read the *first* `[ERROR]` in the output — that's the real bug; everything after it is fallout. Confirm by checking that def alone with `arend --serialize <Module>:<upstream-name>`.
+Look upstream, not at the reported def. A `[GOAL]` on a body you wrote in full usually means an *earlier* definition failed to typecheck, and the reference to it degraded into a hole. Re-run scoped to the whole module (`arend . <Module>`) rather than the one definition, and read the *first* `[ERROR]` in the output — that's the real bug; everything after it is fallout. Confirm by checking that def alone with `arend . <Module>:<upstream-name>`.
 
 ### "Library compiles cleanly per-module but the full-library refresh throws `IllegalArgumentException`"
 
@@ -195,7 +239,11 @@ Usually `linarith` / `equation` choking on a goal where the implicit algebraic c
 
 ### "Module typechecks cleanly but downstream modules report bogus type mismatches like `Rat` vs `Arith.Rat.Rat`"
 
-Stale binary cache after a class refactor. Only a forced recompile fixes it: `arend -r --serialize <module>`. Use both flags — `-r` ignores the `.arc` files but does not delete them, so without `--serialize` the stale caches survive on disk and the *next* plain invocation loads them right back. With the pair, the clean build overwrites them and subsequent invocations are both correct and fast. (See the user's `feedback_arc_cache.md` memory.)
+Stale binary cache after a class refactor. Only a forced recompile fixes it: `arend --no-daemon -r <module>`. Both flags are needed — a daemon-served `-r` is silently ignored, so without `--no-daemon` you get a warm run that reads the same stale state. Serialization is on by default, so the clean build overwrites the bad `.arc` on its way out and subsequent invocations are both correct and fast.
+
+### "The daemon insists a definition I can see doesn't resolve"
+
+Daemon poisoning: a transient resolution error (a duplicate name, a half-saved file) can leave the warm server denying a definition that is plainly present. `-r` won't help — it's one of the flags the daemon eats. Restart it: `arend . --daemon-stop && arend . -d`.
 
 ### "Cannot infer implicit X" inside a `\where`-block lemma calling its outer lemma
 
@@ -212,9 +260,13 @@ Stale binary cache after a class refactor. Only a forced recompile fixes it: `ar
 | "Where is this definition used?" | `-fu` |
 | "What classes extend / instances exist for C?" | `-ch` |
 | "Why isn't X in scope here?" | `-sc` |
-| "I edited; resolve + typecheck." | no flag — `arend --serialize <Module>[:<def>]` is the default workflow |
-| "Make the next typecheck fast (persist `.arc` caches)." | `--serialize` — pass it on every typecheck |
-| "Ignore stale binary caches after a refactor or a hang." | `-r --serialize` (bare `-r` skips them without replacing them) |
+| "I edited; resolve + typecheck." | no flag — `arend . <Module>[:<def>]` is the default workflow |
+| "Make the edit loop fast." | `arend . -d` once per session; every later call auto-routes to the warm daemon |
+| "Is a daemon up, and is it busy?" | `--daemon-ping` (`IDLE` / `BUSY`) |
+| "I edited sources; refresh the daemon's view." | `--daemon-refresh` (re-runs `-ai` on the warm context) |
+| "Resolution candidates + `.sig` mirror + index refresh." | `-ai [MODULE[:DEF]]` |
+| "Ignore stale binary caches after a refactor or a hang." | `--no-daemon -r` (plain `-r` is ignored by the daemon) |
+| "The daemon is wedged / denies a visible definition." | `--daemon-stop`, then `-d` again |
 
 ### `-ss` dialect reference
 
@@ -256,7 +308,9 @@ Treat all of it as the target style *while writing*; Phase 4 is the backstop, no
 
 ## Anti-patterns
 
-- **Typechecking without `--serialize`.** Serialization is opt-in; omit the flag and no `.arc` files are written, so every single invocation re-typechecks arend-lib from source. Turning it off is for diagnosing a suspected cache bug, not a default.
+- **Passing `--serialize`.** The flag was removed in CLI 1.12 and now hard-errors with `Unrecognized option`. Serialization is on by default; `--no-serialize` is the opt-out and you rarely want it.
+- **Running the whole edit loop without a daemon.** Every call then pays JVM startup plus a full library load. `arend . -d` once at the top of the session is the single largest speedup available.
+- **Expecting `-r` to recompile while a daemon is live.** It is parsed and silently discarded. Write `--no-daemon -r`, or stop the daemon first — otherwise you'll conclude "the recompile didn't fix it" from a run that never recompiled.
 - **Reading `arend-lib/src/*.ard` to find a lemma.** Use `-ss` / `-ps` / `-fu` / `-ch` instead; open sources only once they've told you which module to open.
 - **Writing the statement first, then deciding which class to parameterize over.** That decision should come out of `-ch` in phase 2, not from staring at the goal.
 - **Chasing type errors while unresolved references remain.** Resolution and typechecking share one pass, so an unresolved name poisons every type downstream of it. Clear all `Cannot resolve reference` errors first, then re-read what's left — much of it will be gone.

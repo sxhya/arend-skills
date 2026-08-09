@@ -12,17 +12,22 @@ A meta is surface syntax that elaborates to ordinary kernel terms (transport, pm
 
 ---
 
-## Before anything: pass `--serialize`
+## Before anything: start the daemon
 
-Closing goals is iterative — you'll typecheck dozens of times. Don't pay the cold-load cost each round:
+Closing goals is iterative — you'll typecheck dozens of times, and the per-round cost is JVM startup plus a full library load, not your edit. Pay it once:
 
 ```bash
-cd /path/to/arend-lib && arend --serialize <Module>:<def>
+cd /path/to/arend-lib && arend . -d          # once per session
+arend . <Module>:<def>                        # every round after — auto-routes to the daemon
 ```
 
-**Serialization is opt-in** (commit `9a59b3151`). Without `--serialize` no `.arc` binary caches are written, so every one of those dozens of rounds re-typechecks arend-lib from source (~2 min) instead of deserializing the unchanged cone and re-checking only your edit (seconds). Loading existing `.arc` files needs no flag — it's on by default; `--serialize` controls the *write* side only. Everything below assumes you're passing it.
+The daemon is a long-lived JVM holding a warm `ArendServer`. Bootstrap runs `load + typecheck + persist + ai-finalize` once, then it idles; **every later `arend` call in that library routes to it automatically**, no client-side flag. Rounds come back in seconds. `--daemon-ping` reports `IDLE`/`BUSY`, `--daemon-refresh` re-runs the `-ai` bootstrap after source edits, `--daemon-stop` shuts it down, and `--no-daemon` forces one call in-process.
 
-**Turn it off only while diagnosing the cache.** If you hit phantom errors on definitions you didn't touch, bogus mismatches naming the same type twice (`Rat` vs `Arith.Rat.Rat`), or a stack trace out of the (de)serializer, re-run as `arend -r --serialize <Module>` — `-r` skips *loading* the caches but does not delete them, so bare `-r` leaves the poisoned `.arc` on disk for the next plain run to pick up again. Pairing the two overwrites them from a clean build. Go straight back to `--serialize` afterwards.
+> **Flag change (CLI 1.12).** `--serialize` **no longer exists** — it fails with `Unrecognized option: --serialize`. Serialization is on by default; `--no-serialize` is the opt-out. Any note telling you to pass `--serialize` every round predates this.
+
+**The daemon silently ignores `-r`.** On a daemon-served call, `-L`, `-s`, `-e`, `-m`, `-c`, `-r`, `--no-serialize` and `--slow-warn` are parsed and then discarded in favour of the daemon's bootstrap values. So when you hit phantom errors on definitions you didn't touch, bogus mismatches naming the same type twice (`Rat` vs `Arith.Rat.Rat`), or a stack trace out of the (de)serializer, the recovery is **`arend --no-daemon -r <Module>`** — `--no-daemon` so `-r` actually applies, `-r` to skip loading the `.arc` caches. Default-on serialization overwrites them from the clean build, so one run suffices.
+
+**If the daemon itself is wedged, restart it.** A transient resolution error can leave the warm server denying a definition that is plainly visible in the sources; in-daemon `-r` cannot recover it (it's ignored), and `--daemon-refresh` is not reliable here. Use `arend . --daemon-stop && arend . -d`. Separately, older builds reported stored resolver errors only on the first run, so a warm re-run of a broken module could exit 0 in silence (arend-lang/Arend#138, fixed 2026-08-08); on a current build warm exit codes are trustworthy and errors print after the banner.
 
 ---
 
@@ -30,9 +35,9 @@ cd /path/to/arend-lib && arend --serialize <Module>:<def>
 
 For each `{?}` you intend to attack:
 
-1. **Read its full `[GOAL]` block.** Both the expected type *and* the binder list (`Context: ...`). For sub-goals inside `\have` / `\case` chains, the binder list is what tells you what's in scope. Scope the run with the positional rather than filtering the output: `arend --serialize <Module>` lists every goal and error in that module, `arend --serialize <Module>:<def>` narrows to a single definition.
+1. **Read its full `[GOAL]` block.** Both the expected type *and* the binder list (`Context: ...`). For sub-goals inside `\have` / `\case` chains, the binder list is what tells you what's in scope. Scope the run with the positional rather than filtering the output: `arend . <Module>` lists every goal and error in that module, `arend . <Module>:<def>` narrows to a single definition.
 2. **Decide: prove, or decompose?** (See next section.)
-3. `arend --serialize <Module>:<def>`. Read the first error or remaining GOAL. Iterate.
+3. `arend . <Module>:<def>`. Read the first error or remaining GOAL. Iterate.
 
 ---
 
@@ -232,17 +237,19 @@ The names `Algebra.Meta`, `Paths.Meta`, `Meta`, `Function.Meta` are *virtual* (p
 
 - **`Or` constructors `inl`/`inr` need `\import Data.Or`.** They live there, not in `Logic`. The error message (`Cannot find a reference to constructor among provided patterns`) doesn't say "missing import" — recognize the symptom.
 
-- **After creating a new module, the symbol index may lag.** `-ss` is served from a per-library on-disk index that re-parses only changed files, so a brand-new module can be missing from `-ss` / `-fu` / `-ch` results for a round. A "no match" on something you just wrote is an index artefact, not evidence the definition is broken — typecheck the module, then query again.
+- **After creating a new module, the symbol index may lag.** `-ss` is served from a per-library on-disk index that re-parses only changed files, so a brand-new module can be missing from `-ss` / `-fu` / `-ch` results for a round. A "no match" on something you just wrote is an index artefact, not evidence the definition is broken — typecheck the module, then query again. Stage 4 of the `-ai` pipeline is exactly this index rebuild, so `arend . --daemon-refresh` (or a plain `arend . -ai <Module>`) is the direct way to force it.
 
-- **Always pass `--serialize`.** Keeps the `.arc` caches current so the next round deserializes instead of re-typechecking from source. Default for every `arend` invocation, not just specific ones.
+- **Keep a daemon up for the whole session.** `arend . -d` once; every later call auto-routes to it. Serialization is on by default now, so `.arc` caches stay current with no flag.
 
-- **If `arend` hangs or comes back with empty output, suspect the binary caches.** Serialization round-tripping is still imperfect, so a stale or half-written `.arc` is the most likely cause. Re-run as `arend -r --serialize <Module>` — `-r` ignores the caches for this pass and `--serialize` replaces them from the clean build. (Bare `-r` skips loading without deleting anything, so the bad caches would just come back on the next plain run.)
+- **If `arend` hangs or comes back with empty output, suspect the binary caches *or* the daemon.** A stale or half-written `.arc` is one cause; a wedged warm server is the other. Re-run as `arend --no-daemon -r <Module>` — that bypasses both at once (`--no-daemon` because a daemon-served `-r` is ignored, `-r` to skip cache loading), and default-on serialization replaces the caches from the clean build. If the clean run is fine but the warm one isn't, restart the daemon: `arend . --daemon-stop && arend . -d`.
 
-- **A report that looks suspiciously short is a cache symptom, not a formatting one.** If the output disagrees with what's on disk, re-run with `-r --serialize` and compare — a from-source pass is the authoritative second opinion.
+- **A report that looks suspiciously short is a cache or daemon symptom, not a formatting one.** If the output disagrees with what's on disk, re-run with `--no-daemon -r` and compare — a from-source, out-of-daemon pass is the authoritative second opinion.
+
+- **`.sig/<module>.ard` is verified-only, so it is safe to trust.** The `-ai` pipeline (which the daemon runs at bootstrap, and `--daemon-refresh` re-runs) mirrors every typechecked module as signatures with bodies replaced by `{?}`; anything that failed to typecheck appears as `-- skipped: <name> (typecheck errors)` instead. Reading `.sig` therefore never shows you a signature that doesn't hold — it is the cheapest source of truth after `-ss`.
 
 - **`arend <Module>` from outside the library crashes with `NullPointerException: ctx.outputRouter is null`.** Run the typecheck workflows and `-ss` / `-ps` / `-fu` / `-ch` / `-sc` from inside the library directory (`cd arend-lib && arend …`).
 
-- **If `arend` throws a Java exception (stack trace, not a typecheck error), snapshot the cache state before recovering.** The current `.arc` binaries at the moment of crash are the only evidence for the serialization bug that produced them; recompiling from sources destroys that evidence. Before retrying, zip the entire arend-lib tree (sources, `bin/*.arc`, everything) to a timestamped archive outside the tree: `zip -qr /tmp/arend-lib-crash-$(date +%Y%m%d-%H%M%S).zip <path-to-arend-lib>`. Only then re-run with `arend -r --serialize <Module>`. Mention the archive path to the user so they can pick it up for serialization debugging.
+- **If `arend` throws a Java exception (stack trace, not a typecheck error), snapshot the cache state before recovering.** The current `.arc` binaries at the moment of crash are the only evidence for the serialization bug that produced them; recompiling from sources destroys that evidence. Before retrying, zip the entire arend-lib tree (sources, `bin/*.arc`, everything) to a timestamped archive outside the tree: `zip -qr /tmp/arend-lib-crash-$(date +%Y%m%d-%H%M%S).zip <path-to-arend-lib>`. Only then re-run with `arend --no-daemon -r <Module>`. Mention the archive path to the user so they can pick it up for serialization debugging.
 
 ---
 
@@ -698,9 +705,11 @@ Anything that felt unreasonable about the **tooling** — surprising typechecker
 
 ## Anti-patterns
 
-- **Iterating proof attempts without `--serialize`.** Serialization is opt-in, so without the flag nothing is cached and every cycle re-typechecks arend-lib from source — ~2 min per attempt instead of seconds. Turning it off is for diagnosing a suspected cache bug, not a default.
+- **Iterating proof attempts without a daemon.** Every cycle then pays JVM startup plus a full library load — minutes per attempt instead of seconds. `arend . -d` once at the top of the session.
+- **Passing `--serialize`.** Removed in CLI 1.12; it now hard-errors. Serialization is on by default and `--no-serialize` is the opt-out.
+- **Concluding "the recompile didn't help" from a daemon-served `-r`.** The daemon discards `-r`, so nothing was recompiled. Use `--no-daemon -r`.
 - **Attacking a 200-line proof as one expression.** Decompose first, attempt second.
-- **Filtering typecheck output with `grep "GOAL"`.** Narrow the *scope* instead of the *output* — `arend --serialize <Module>:<def>` checks only the def you care about, and grep would cut off the `Expected type:` / `Context:` lines that make a `[GOAL]` block worth reading.
+- **Filtering typecheck output with `grep "GOAL"`.** Narrow the *scope* instead of the *output* — `arend . <Module>:<def>` checks only the def you care about, and grep would cut off the `Expected type:` / `Context:` lines that make a `[GOAL]` block worth reading.
 - **Working around a missing 3-line helper inline.** Add it to the right module; everyone benefits. (And don't log it as an "issue" — just add it.)
 - **Spending an hour on `transport (\lam x => x.U _) p t` when `rewrite p` works.** Recognize the "Expected type: a class" symptom early.
 - **Treating a typechecking proof as "done" without re-reading it.** Same caveat as the formalize skill — typechecking proves consistency, not faithfulness. Verify the proof closes the *intended* mathematical goal.

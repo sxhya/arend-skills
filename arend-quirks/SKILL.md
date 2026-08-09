@@ -372,7 +372,7 @@ The `{-1}` inside `x^{-1}` opens a nested comment. The closing `-}` of the doc b
 - Wildly distant errors like "no such module" or "definition X not found" appear in *other* files that depended on the swallowed ones.
 - **Within one file, the report is `Cannot resolve reference 'X'` at the *consumer*** — a line 20 lines below a definition of `X` that is plainly visible in the source. Nothing points at the comment.
 - The swallowed range ends at the *next* `-}` in the file, not at EOF, so which definitions vanish looks arbitrary: three consecutive ones can disappear while a fourth further down survives.
-- `-r --serialize` changes nothing (it is not a cache problem) — don't spend a rebuild on that guess.
+- A forced recompile (`--no-daemon -r`) changes nothing, and neither does restarting the daemon — it is not a cache problem. Don't spend a rebuild on that guess.
 - **Fastest confirmation: `arend -ss <name>` returns `No matches` for a definition that is on screen.** If the symbol index cannot see it, the parser never saw it either. (Contrast with the genuine index lag for brand-new *modules*, noted in **arend-prove**.)
 
 A real instance: `{- | The Kneser factor $q = 1 - 3^{-2n^2 - n}$ … -}` — the `{-` in `^{-2` swallowed `kneser-q`, its two bound lemmas, and two more helpers.
