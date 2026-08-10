@@ -136,11 +136,20 @@ The names `Algebra.Meta`, `Paths.Meta`, `Meta`, `Function.Meta` are *virtual* (p
 
     Also folding-related, same family:
 
-    - **A `\func`-defined constant is not unfolded.** With `\func one/3 : Real => ratio 1 3`, the goal `pow one/3 n * eps <= one/3 * eps` carries no numeric content — `one/3` is an atom. Write `(ratio 1 3 : Real)` instead. (arend-lib's own `one/3>0` is stated with `ratio 1 3`, not `one/3` — same lesson, learned earlier.) Likewise a `\func` like `kneser-q n => 1 - pow one/3 (2 * n * n + n)` stays folded: restate the goal with the body spelled out and convert at the end via `=_<= equation.cRing`.
+    - **A `\func`-defined constant is not unfolded — but a `\meta` one is.** With `\func one/3 : Real => ratio 1 3`, the goal `pow one/3 n * eps <= one/3 * eps` carries no numeric content: `one/3` is an atom, and even `one/3 > 0` fails with `Cannot solve the equation`. Spelling out `(ratio 1 3 : Real)` at every site works but is verbose and leaves the file with two spellings of one constant. **The fix that keeps the abbreviation is `\meta`**, which is pure syntactic substitution, so `linarith` sees the literal:
+
+      ```arend
+      \private \meta one/3 => (ratio 1 3 : Real)                    -- linarith sees through this
+      \private \lemma one/3>0 : one/3 > {RealField} 0 => linarith   -- now closes
+      ```
+
+      **The ascription is mandatory.** A bare `\meta one/3 => ratio 1 3` expands to a `Rat`, and every `pow one/3 k` then loses the instance that `one/3 : Real` used to pin — verified as ~12 `Type mismatch` / `Cannot find subexpression` errors across one file. Live use: `Arith/Complex/FTA/Kneser.ard:48`, where switching `\func` → `\meta` let all 14 workaround spellings of `ratio 1 3` collapse back to `one/3`.
+
+      A *parameterised* `\func` such as `kneser-q n => 1 - pow one/3 (2 * n * n + n)` is a different case — it stays folded and is meant to (the named `kneser-q>0` / `kneser-q<1` lemmas are its interface). There, restate the goal with the body spelled out and convert at the end via `=_<= equation.cRing`.
     - **`Real.fromRat 1` is not the literal `1`** as far as the solver is concerned, even though they are definitionally equal. Re-annotating the hypothesis (`\have | h' : <same statement with 1> => h`) costs nothing and fixes it.
     - **Trim the context with `usingOnly`.** Past ~20 hypotheses the solver starts failing on goals it can do; and unrelated `Nat` facts in scope print as `coefMap {?this} (fromInt …)` with unresolved metas. `usingOnly (h1, …, h5) linarith` both speeds it up and makes the failure output readable.
 
-    Worked example: `Algebra/Field/FTA.ard:KneserLemma` — `sums''`, `cond2'`, `q-eq`, `h4`, `h5` exist purely to hand the solver a distributed, order-normalised, `usingOnly`-restricted system.
+    Worked example: `Arith/Complex/FTA/Kneser.ard:KneserLemma` (was `Arith/Real/KneserLemma.ard`, moved 2026-08-10) — `sums'`, `cond2'`, `q-eq`, `lower-scaled`, `eps-third` exist purely to hand the solver a distributed, order-normalised, `usingOnly`-restricted system.
 
 12. **`linarith` chokes on symbolic identities — reach for `equation.cRing` instead.** `linarith` solves *linear (in)equalities* with atoms; it can normalize `2 * x + 3 * y <= 5` but not `(A - B) - (A + B) = -2 * B` where the goal is a symbolic identity (`2` may appear as `natCoef 2`, `negative (...)` blocks linarith's normalization). When linarith fails with `Cannot solve the equation` and prints two algebraically-equivalent sides (often differing in `natCoef 2` vs literal `2`, or by `negative` placement), switch to `equation.cRing`. Rule of thumb: linarith is for **numeric** inequality goals; `equation.cRing` is for **polynomial-identity** equality goals; they don't substitute for each other even when both seem applicable.
 
