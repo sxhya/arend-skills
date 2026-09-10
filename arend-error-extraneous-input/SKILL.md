@@ -60,6 +60,37 @@ Workflow when this fires:
 
 ---
 
+### Arend 1.11 universe syntax inside a meta block (2026-08-12)
+
+**Repro:** any pre-1.12 universe form inside a `quot { … }` (or other block-argument meta) — from `arend-bootstrap/test/Quote.ard` and `test/Typecheck.ard`:
+
+    \func sortNum : Expr => quot { \Type 0 1 }          -- two level args
+    \func sortLpLh : Expr => quot { \Type \lp \lh }     -- \lp / \lh
+    ... : \Sigma (u : \Pi (A : \Type 0 0) …) (v : \oo-Type 0)
+
+**Error:** reported at the `{` that *opens the meta block*, with an expecting-set consisting entirely of top-level statement keywords — plus two follow-on errors that make the meta look like the culprit:
+
+    extraneous input '{' expecting {<EOF>, '\open', '\import', …, '\class', '\record', …}
+    Expected a single expression to quote
+      In: quot
+    Cannot infer an expression
+      In: _
+
+**Fix:** translate to 1.12 universes — `\Type` now takes a *single* predicative level, and the homotopy level is part of the keyword:
+
+| 1.11 | 1.12 |
+|---|---|
+| `\Type p h` | `\<h>-Type p` (`\Type 0 1` → `\1-Type 0`, `\Type 5 7` → `\7-Type 5`) |
+| `\Type p 0` | `\Set p` |
+| `\oo-Type p` | `\Type p` |
+| `\Type \lp \lh` | declare a level param and use it: `\func f.{l} … => quot { \Type l }` |
+
+**Why:** 1.12 deleted `\Type`'s second level argument along with `\lp`, `\lh` and `\oo-Type` (Arend commits `Delete \lp`, `Delete \lh and \oo levels`, `Delete h-level expressions from Concrete.UniverseExpression`). The leftover level token makes the block contents unparseable as an expression; the parser abandons the enclosing definition and resynchronizes at statement level, so it blames the block's opening brace. Nothing in the message mentions universes or levels.
+
+**Diagnostic:** an `extraneous input '{'` whose expecting-set is *all statement keywords* (`'\open'`, `'\import'`, `'\func'`, …) means the parser fell back to top-level parsing — so the definition *before* that `{` failed to parse. If it contains a meta block, look inside the block for removed syntax rather than at the meta. Confirmation: a same-file sibling differing only in universe form parses fine (`quot { \Set 3 }` next to a failing `quot { \Type 0 1 }`).
+
+---
+
 ## How to extend this skill
 
 When you fix a fresh `extraneous input` instance whose root cause isn't in the catalogue above:

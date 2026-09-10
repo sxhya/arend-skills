@@ -184,6 +184,32 @@ The names `Algebra.Meta`, `Paths.Meta`, `Meta`, `Function.Meta` are *virtual* (p
 
 17. **`rewrite zro_*-left` / `zro_*-right` over `Real` can misfire.** `zro * x` normalizes to `fromRat zro`, so the pattern that gets searched is not the one you wrote and the rewrite can hit the wrong side (symptom: an argument's expected type collapses to `zro < fromRat zro`). Use `transportInv (\`< <the other side>) zro_*-left h` there — the explicit motive says exactly which occurrence to abstract.
 
+18. **`rewrite cabs_*` (bare implicits) cannot match a `Complex` product, and the error prints an `Expression:` that visibly contains the pattern it says is missing.** `ComplexField.*` is `\lam x y => \new Complex (x.re * y.re - x.im * y.im) (…)` — a body with no pattern matching, so it reduces **unconditionally**, for variable operands too. `h * h` therefore normalizes to a record literal and the goal contains no `*`-application at all; the pattern `cabs (?x * ?y)` has nothing to bind to, so the metas stay unsolved. The pretty-printer re-folds the record literal back to `h * h`, which is why the diagnostic reads as a contradiction:
+
+        [ERROR] Cannot find subexpression
+          Subexpression: cabs ({?error} * {?error})
+             Expression: cabs (h * h * q) = cabs h * cabs h * cabs q
+        [ERROR] Cannot infer parameter 'x' of definition 'cabs_*'
+
+    Verified 2026-08-11 on Arend 1.12. **`{?error}` metas inside a "cannot find subexpression" message mean the pattern was never built** — read it as "could not solve the implicits", not "the term is absent".
+
+    Scope, measured rather than guessed: it is *not* tuple-specific (a single `rewrite cabs_* t` fails the same way), *not* goal-shape-specific (equality and `<=` goals both fail), and *not* a general `rewrite` weakness (`rewrite NatSemiring.+-comm idp` on `Nat` works, tuple or not). It is specific to operations on a concrete record instance.
+
+    Two fixes:
+    - **Spell the implicits**: `rewrite (cabs_* {h * h} {q}, cabs_* {h} {h}) t` typechecks the otherwise-identical goal.
+    - **Hoist to a helper with explicit parameters** when the operands are long: `\lemma cabs_*3 (x y q : Complex) : cabs (x * y * q) = cabs x * cabs y * cabs q`, then `rewrite (…, cabs_*3 h h <third factor>) …`. Inside the helper the implicits still need spelling out.
+
+    Same cause, different surface: bare `cabs>=0` fails where `RealField.<=_*_positive_positive cabs>=0 cabs>=0` is expected — write `cabs>=0 {h}`. Live instance: `Arith/Complex/Algebraic/Taylor.ard:polyTaylor2-bound`. This is the `rewrite` face of failure mode 16 and of **arend-quirks** §4's concrete-record note; it is *not* mode 15 (pattern present only after a reduction the search won't perform).
+
+19. **`cases (e arg addPath)` binds pattern components whose types are unsolved metas, so `\Sigma`-eta does not fire on them and two such witnesses will not compose.** `\Sigma` (the unit) *does* have definitional eta — `\lemma unit-eq {u t : \Sigma} : u = t => idp` typechecks. But inside two sibling `cases (… arg addPath)` blocks over `Or B (\Sigma)`, the unit components bound by the `inr` patterns do not unify, and `p *> inv q` fails with a type mismatch whose two sides print *identically*:
+
+        Expected type: e.f (inr {A} {\Sigma} ()) = inr {u} u
+          Actual type: e.f (inr {A} {\Sigma} ()) = inr {t} t
+
+    Note the tell: the left-hand sides carry solved implicits (`{A} {\Sigma}`) while the right-hand sides print the bound variable in the *implicit* slot — that slot is an unsolved meta, and eta cannot fire on a term of unknown type. Writing `_` instead of naming the pattern variable makes it worse (both sides print `inr {_x} _x` and the mismatch looks like a compiler bug).
+
+    Fix: force the types at the composition site — `p *> inv (q *> pmap (inr {B} {\Sigma}) (unit-eq {t} {u}))`. Spelling `inr`'s implicits solves the metas, and the explicitly-instantiated eta lemma supplies the path. Verified 2026-08-13 on Arend 1.12, `Set/Fin/Subtraction.ard:punch-inv`.
+
 ### Workflow and language gotchas
 
 - **`\peval` is for `\sfunc` only.** Plain `\func`s reduce by definition; `\peval` on them errors with `Expected a function or an \scase expression`.
@@ -602,6 +628,49 @@ A practical hybrid: use `\case \elim n` to set up induction, prove the trivial b
 
 Apply these while writing, not only on a post-pass:
 
+- **Flatten `\case … \with { | inP (…) => … }` into `\let | (inP (…)) => e`.** This is the single biggest de-bloater in existential-heavy developments: every `\case` on a `TruncP` costs a nesting level and two lines of punctuation, and a chain of five of them buries the punchline 20 columns deep. `\let` bindings are sequential, so a whole cascade collapses to one flat block:
+
+    ```arend
+    \let | (inP (e1, e1>0, e1<eps)) => shrink eps>0
+         | (inP (delta', delta'>0, IH)) => match-bounded B>=1 e1>0
+         | (inP (q, q>0, qP))          => split-eps delta'>0 …
+    \in inP (…)
+    ```
+
+  Works wherever the result type is a `\Prop` (which is the case for every `∃`-returning lemma). Established arend-lib idiom — ~30 sites. Keep `\case` only for genuinely multi-constructor scrutinees (`||`, `Dec`, `Or`).
+
+- **Interleave `\let` and `\have` at one indentation level** rather than nesting. `\let … \in \have … \in \let … \in body`, each `\in` starting a line at the same column, reads as a linear derivation and honours "`\have` for proofs, `\let` for values".
+
+- **`\have` works as a `run { … }` entry** and scopes over the rest of the block, exactly like `\lam x,`:
+
+    ```arend
+    => run {
+      \have | tail : … => …
+            | eq   : … => …,
+      rewrite eq,
+      <final term using tail>
+    }
+    ```
+
+  Verified 2026-08-10. Worth it when the payoff after the rewrite is short; if the final term is the bulk of the proof, plain `\have … \in rewrite eq $ …` reads better because it keeps the punchline on top.
+
+- **`rewrite p t` instead of `transportInv (\lam t => C t) p t`** whenever the goal is the thing being reshaped. Declaring the rewriting lemma with *implicit* arguments (`polyCoef_- {a b j}`, not `polyCoef-minus (a) (b) (j)`) is what makes this pay: the call site becomes a bare `rewrite polyCoef_- h` instead of a motive plus three spelled-out arguments. Use `rewriteI` for the other direction. `transport` survives only where the expected type is *not* pinned (an argument of `linarith (…)`, one side of a `<=∘` whose middle term is free).
+
+- **Merge consecutive rewrites into the tuple form.** `rewrite (A, B) $ rewrite (C, D) t` → `rewrite (A, B, C, D) t`; the tuple form *is* nested rewrites applied left to right.
+
+- **Pattern-match arrays with `::` instead of rebuilding the tail.** A function over `Array A n` written `\elim n` has to spell its tail as `\new Array A n (\lam i => r (suc i))` at every recursive call and in every downstream lemma. Switching the signature to `\elim n, r` with clauses `| 0, nil` / `| suc n, a :: l` makes the tail the bound variable `l` and deletes the noise everywhere:
+
+    ```arend
+    \func prodLin {R : CRing} {n : Nat} (r : Array R n) : Poly R \elim n, r
+      | 0, nil => 1
+      | suc n, a :: l => prodLin l * padd 1 (negative a)
+    ```
+
+  The cost is that `prodLin r` no longer reduces for a *variable* `r` (arend-quirks §3) — so convert the whole family of functions and lemmas over the same array together. Literal `z :: r'` call sites still reduce, and record-eta made the old form reduce to the same thing anyway.
+
+- **An eta-lambda `(\lam k => f k)` is not always removable.** If the expected domain is `Fin m` and `f`'s is `Nat`, the lambda is carrying the `Fin → Nat` coercion; deleting it gives `Type mismatch: \Pi (k : Fin m) -> … vs \Pi (k : Nat) -> …`. Drop eta-lambdas only when both domains agree.
+
+- **Abstract a repeated compound constant into a parameter of the helper, not a `\have`.** When a bound like `coefMax {C} (p - monomial 1 (suc m)) (suc m)` appears five times inside one proof, `linarith`/`equation.cRing` treat it as an opaque blob and every line grows by 50 characters. Give the helper lemma `{C : Real} (C>=0 : 0 <= C) (hC : \Pi k -> … <= C)` and pass the concrete bound once at the call site: inside the helper `C` is a genuine variable, so the solvers see through it. A `\have C => <blob>` does *not* work here — the binding is opaque to implicit-argument inference (arend-quirks §7); bind the *proof* (`\have C>=0 => coefMax>=0 {…} {…} {…}`) instead and let `?C` be read off its type.
 - **Delete** idp-bodied lemmas and `pmap f idp` steps — they carry no content.
 - **Inline** single-use helpers and single-use `\have` clauses.
 - **Replace** hand-stepped `\have` chains with `simplify` / `equation.cRing` / `linarith` where one of them closes the goal outright.

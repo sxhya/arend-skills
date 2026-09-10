@@ -97,6 +97,36 @@ The Expected is a path with two metavariables — i.e. Arend wanted `\peval` to 
 
 **Diagnostic:** a `Type mismatch` between two structurally identical `\new Complex …` terms where one side has `re {x}` / `im {x}` and the other has plain `x`. That asymmetry means a coercion fired on one side only — look for an unannotated lambda binder, not for a wrong lemma.
 
+### Stripped parentheses around an infix operator (compaction regression) (2026-08-10)
+
+**Repro:** a "de-noising" pass over existing code deletes parentheses that were load-bearing. Two distinct shapes, both silent at parse time:
+
+1. **Operator-as-argument.** `\new AddGroup G.E G.ide (G.*) G.ide-left …` compacted to `\new AddGroup G.E G.ide G.* G.ide-left …`. The parser stops reading an application and starts reading an *infix expression*: `G.ide G.* G.ide-left`. Same for `Big (∨) (l 0) (tail l)` → `Big ∨ (l 0) (tail l)` and `pmap2 (+) p q` → `pmap2 + p q`.
+2. **Precedence.** `a * (b ∧ c)` → `a * b ∧ c`. Both `*` and `∧` are `\infixl 7`, so this silently re-associates to `(a * b) ∧ c`. `a * (b ∨ c)` → `a * b ∨ c` is worse (`∨` is `\infixl 6`). Same trap with any `\infixl 7` custom operator: `c *c (p + q)` → `c *c p + q`, `(x + y) *i a` → `x + y *i a`.
+
+**Misleading output:** shape (1) reports the mismatch at the *class/record* being constructed, printing a partially-implemented class as the actual type —
+
+```
+[ERROR] Algebra.Group:245:48: Type mismatch
+  Expected type: G.E
+    Actual type: \Set
+  In: AddGroup { | E => E {G} | zro => ide {G} }
+[ERROR] Algebra.Group:245:84: Type mismatch
+  Expected type: I
+    Actual type: ?x G.* G.ide = ?x
+  In: ide-right {G}
+```
+
+`Expected type: I` is the tell: the elaborator has shifted every remaining argument one slot left, so a proof landed where a `Path`'s interval argument belongs.
+
+Shape (2) usually typechecks the *statement* fine and fails in the body or at the first consumer, with two sides that are equal up to re-bracketing (`Cannot solve equation: 1st: r *c a + b, 2nd: r *c (a + b)`).
+
+**Blast radius:** breaking a `\use \coerce` (as in `AddGroup.toGroup` / `fromGroup`) cascades into a hundred errors across a dozen *unmodified* modules (`Algebra.Solver.CGroup`, `Algebra.Ring.Factor`, `Topology.NormedAbGroup`, …). Never start debugging at the module you were asked about — sort the error list by module and fix the topmost one in dependency order.
+
+**Fix:** restore the parentheses. `git diff HEAD -- <file>` is faster than reading the error: scan the diff for hunks whose only change is removed `(` / `)` around an operator.
+
+**Diagnostic:** any `Type mismatch` naming a `\new`/`\class` body as Actual, or an `Expected type: I`, or a `Cannot solve equation` whose two sides differ only in bracketing — check `git diff` for stripped parens before believing the types. If the working tree has an uncommitted refactor and errors appear in files that refactor never touched, this is almost certainly it.
+
 ---
 
 ## How to extend this skill
