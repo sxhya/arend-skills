@@ -244,7 +244,20 @@ For the catalog of metas (`rewrite`, `ext`, `simplify`, `equation`, `cong`, `lin
 ## 12. Syntax quirks I keep forgetting
 
 - All keywords start with `\`: `\func`, `\data`, `\class`, `\record`, `\let`, `\with`, `\elim`, `\case`, `\lam`, `\Pi`, `\Sigma`, `\new`, `\this`, `\where`, `\open`, `\import`, `\hiding`, `\using`, `\instance`, `\cowith`, `\scase`, `\sfunc`, `\lemma`, `\property`, `\field`, `\truncated`, `\coerce`, `\level`, `\eval`, `\extends`.
-- Infix: `\infix`, `\infixl`, `\infixr` + priority 1–9. Prefix application of an infix with backticks: ``x `op` y``.
+- Infix: `\infix`, `\infixl`, `\infixr` + priority 1–9. Backticks convert *between* fixities on an ordinary function: ``x `op` y`` makes a prefix function infix, and ``x `op y z`` makes it postfix (`` 3 Test.`f 1 2 `` ≡ `f 3 1 2`). Both work on qualified names — `` suc 4 Nat.`div` suc 1 `` typechecks.
+- **A leading bare infix operator is a right *section*, not a prefix application — so `+ 3 4` is an error.** This is the rule that most often breaks code written from Haskell/Coq habits, and it is silent at parse time. Verified 2026-09-10 against branch `staging` (`src/test/java/org/arend/typechecking/InfixPostfixTest.java`):
+
+  | Form | Meaning |
+  |---|---|
+  | `3 + 4` | ordinary infix application |
+  | `(+) 3 4` | **prefix application — parenthesize the operator** |
+  | `(+ e)` | right section `\lam x => x + e`; `(+ (suc 1)) 5` is `7` |
+  | `+ 3 4` | **error** — parsed as a section, so the second argument is applied to a `Nat` |
+
+  Everything after a leading operator is its *right operand*, so `(+ suc 1) 5` is `\lam x => x + suc 1` applied to `5`. Passing an implicit does not opt out: `+ {r} 0 1` errors while `(+ {r} f 3) 4` is a section and typechecks. Ordinary (non-`\infix`) functions are unaffected — `(f 5) 2` is fine — and field operators section identically: `r.+ 1` ≡ `\lam x => x r.+ 1`.
+
+  Practical consequence: **an infix operator passed as an argument always needs its parens.** `pmap2 (+) p q`, `\new AddGroup G.E G.ide (G.*) …`, `Big (∨) (l 0) (tail l)`. Dropping them is the compaction regression catalogued in **arend-error-type-mismatch** (*Stripped parentheses around an infix operator*); depending on whether operands surround the operator you get either that entry's bogus `Type mismatch` / `Expected type: I`, or — when the operator leads — `Expression is applied to an argument, but does not have a function type`.
+- **A backticked reference with no operands is rejected outright.** `` \func test => Nat.`div` `` gives `Infix notation is not allowed here`, and `` Nat.`div `` gives `Postfix notation is not allowed here` (`base/src/main/java/org/arend/naming/resolving/visitor/ExpressionResolveNameVisitor.java:294` for plain references, `:336` for field calls). `` Test.`pair`.1 `` fails earlier still, at parse. Backticks are fixity *annotations on an application*, not a way to name an operator — to denote the operator itself, parenthesize: `(Nat.div)`.
 - Comments: `-- line`, `{- nestable block -}`.
 - `()` pattern — absurd case, RHS omitted. Often nested: `| fsuc (fsuc (fsuc ()))`.
 - `\as x` binds an as-pattern; in `\case`, `\as x \return T[x]` is the dependent idiom.

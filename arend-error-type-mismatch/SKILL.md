@@ -102,6 +102,8 @@ The Expected is a path with two metavariables — i.e. Arend wanted `\peval` to 
 **Repro:** a "de-noising" pass over existing code deletes parentheses that were load-bearing. Two distinct shapes, both silent at parse time:
 
 1. **Operator-as-argument.** `\new AddGroup G.E G.ide (G.*) G.ide-left …` compacted to `\new AddGroup G.E G.ide G.* G.ide-left …`. The parser stops reading an application and starts reading an *infix expression*: `G.ide G.* G.ide-left`. Same for `Big (∨) (l 0) (tail l)` → `Big ∨ (l 0) (tail l)` and `pmap2 (+) p q` → `pmap2 + p q`.
+
+   Which error you get depends on whether operands surround the stripped operator. Mid-application (as in `G.ide G.* G.ide-left`) it re-parses as an infix expression and you get the misleading `Type mismatch` below. When the operator ends up *leading* — `pmap2 + p q`, or the bare `+ 3 4` shape — it is instead read as a right section, and the error is `Expression is applied to an argument, but does not have a function type`. Both have the same fix (restore the parens) and the same tell (`git diff` shows only removed brackets). See **arend-quirks** §12 for the section rule itself.
 2. **Precedence.** `a * (b ∧ c)` → `a * b ∧ c`. Both `*` and `∧` are `\infixl 7`, so this silently re-associates to `(a * b) ∧ c`. `a * (b ∨ c)` → `a * b ∨ c` is worse (`∨` is `\infixl 6`). Same trap with any `\infixl 7` custom operator: `c *c (p + q)` → `c *c p + q`, `(x + y) *i a` → `x + y *i a`.
 
 **Misleading output:** shape (1) reports the mismatch at the *class/record* being constructed, printing a partially-implemented class as the actual type —
