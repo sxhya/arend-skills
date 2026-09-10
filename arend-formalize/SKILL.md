@@ -14,15 +14,24 @@ For language-level surprises while writing the statement, see the **arend-quirks
 
 ## Phase 0 — Start the daemon
 
-> **Flag change (CLI 1.12).** `--serialize` **no longer exists** — passing it fails with `Unrecognized option: --serialize`. Serialization is now **on by default** and `--no-serialize` is the opt-out. Everything below reflects the current CLI; older notes telling you to pass `--serialize` on every call are stale.
+> **`--serialize` exists and is opt-in.** Verified against `ConsoleMain.parseArgs` on the current tree: the flag is registered as
+> *“after typechecking, persist typechecked modules as .arc binary caches; **without this flag, no .arc files are written**”*.
+> There is **no `--no-serialize`** — passing it fails with `Unrecognized option: --no-serialize`.
+> An earlier revision of this skill claimed the opposite (removed flag, serialization on by default, `--no-serialize` opt-out).
+> That was wrong in both directions; every recipe below has been corrected. **Writing `.arc` requires `--serialize` on the call
+> that does the typechecking** — and for a daemon-served call that means on the `-d` bootstrap (see below).
 
 The edit loop is dominated by JVM startup and library load, not by typechecking your edit. The fix is the **daemon**: a long-lived JVM holding a warm `ArendServer`. Start it once per session:
 
 ```bash
-cd /Users/sergey.sinchuk/Documents/Arend/arend-lib && arend . -d
+cd /path/to/arend-lib && arend . -d --serialize
 ```
 
-Bootstrap does the full `load + typecheck + persist + ai-finalize` once, then idles. **Every subsequent `arend` call in that library auto-routes to it** — no flag needed on the client side — so a scoped typecheck comes back in seconds instead of minutes.
+Bootstrap runs the ordinary typecheck pipeline once over the whole library — with exactly the flags `-d` forwarded
+(`-s -e -m -c -r --serialize`) — and then idles. **Every subsequent `arend` call in that library auto-routes to it**
+— no flag needed on the client side — so a scoped typecheck comes back in seconds instead of minutes.
+`--daemon-refresh` re-submits that same frozen bootstrap argv against the warm context (`DaemonServer`'s `refresh`
+op literally replays `ctx.bootstrapArgs`), which is how source edits get picked up.
 
 | Command | Effect |
 |---|---|
@@ -38,8 +47,16 @@ Bootstrap does the full `load + typecheck + persist + ai-finalize` once, then id
 This is the part that bites. On a daemon-served call these are **parsed but silently ignored**, locked to the daemon's bootstrap values:
 
 ```
--L   -s   -e   -m   -c   -r   --no-serialize   --slow-warn
+-L   -s   -e   -m   -c   -r   --serialize
 ```
+
+(That is `LockedFlags.NAMES` verbatim. `--slow-warn` is **not** a flag on the current tree either — an older
+revision listed it here and it hard-errors.)
+
+`--serialize` being locked is the second consequential entry: **a daemon started without `--serialize` will never write an
+`.arc` file, no matter how many served calls pass the flag.** If you want warm caches, bootstrap with
+`arend . -d --serialize` — `-d` forwards `-s -e -m -c -r --serialize` to the child JVM, and the child's copy is the one
+that counts. `--daemon-status` prints the locked set actually in force, so it settles the question.
 
 `-r` being in that list is the consequential one: **a plain `arend -r <Module>` against a live daemon does not recompile anything.** To actually force a from-source pass you must either add `--no-daemon`, or `--daemon-stop` first.
 
@@ -50,7 +67,7 @@ These are rejected outright inside a daemon-served command (not ignored — hard
 | | Behaviour |
 |---|---|
 | **Loading** existing `.arc` | On by default. `-r` / `--recompile` turns it off for one run — *but see the daemon-eats-`-r` note above*. |
-| **Writing** `.arc` after typecheck | **On by default.** `--no-serialize` turns it off. |
+| **Writing** `.arc` after typecheck | **Off by default.** `--serialize` turns it on. There is no `--no-serialize`. On a daemon-served call the flag is locked to the `-d` bootstrap's value. |
 
 **When the cache itself is the suspect.** After a class-hierarchy refactor, cached expressions referencing the old internal terms still deserialize cleanly and report errors that don't exist in the sources. Symptoms:
 
@@ -58,7 +75,14 @@ These are rejected outright inside a daemon-served command (not ignored — hard
 - Errors on definitions you never touched, which vanish under `-r`.
 - A Java stack trace out of the (de)serializer rather than a typecheck diagnostic.
 
-Recover with **`arend --no-daemon -r <Module>`**. Both parts matter: `--no-daemon` because a daemon-served `-r` is a no-op, and `-r` because it skips *loading* the caches. Serialization being on by default means the clean build overwrites the poisoned `.arc` on the way out, so one run is enough — the old `-r --serialize` pairing is obsolete.
+Recover with **`arend --no-daemon -r --serialize <Module>`**. All three parts matter:
+
+- `--no-daemon` because a daemon-served `-r` is a no-op;
+- `-r` because it skips *loading* the caches;
+- `--serialize` because otherwise the clean build **writes nothing** and the poisoned `.arc` is still on disk for the next run.
+
+The `-r --serialize` pairing is therefore *required*, not obsolete: `-r` reads past the bad cache, `--serialize` replaces it.
+Drop `--serialize` and you get a correct one-off answer followed by the same bogus errors on the very next invocation.
 
 ### The daemon has its own failure mode: poisoning
 
@@ -72,7 +96,13 @@ Related, and now fixed: the daemon used to report stored resolver errors only on
 
 ### `-ai` — the agent-oriented pipeline
 
-The daemon's bootstrap *is* `-ai`, and `--daemon-refresh` re-runs it. Standalone: `arend . -ai [MODULE[:DEF]]`. Four stages:
+> **Not present on the current tree (verified 2026-09-10).** `-ai` is not a registered option in
+> `ConsoleMain.parseArgs` on either `staging` or `cliDaemon-9`, no source file writes a `.sig/` mirror, and
+> `TypecheckPipeline` contains no symbol-index refresh. Passing `-ai` hard-errors with `Unrecognized option`.
+> The daemon's bootstrap is a plain typecheck of the library, **not** an `-ai` pipeline. Treat this section as a
+> description of an unmerged/planned feature; do not build a workflow on it until `-ai` shows up in `--help`.
+
+As designed, the daemon's bootstrap would *be* `-ai` and `--daemon-refresh` would re-run it; standalone `arend . -ai [MODULE[:DEF]]`. Four stages:
 
 1. **Name resolution (suggest-only)** — for each unresolved short name, prints a `Candidates for 'X' at …` block with each candidate's `library::module:longName`, the qualified name to splice in, and the required import. It never rewrites your sources; you paste the pick yourself.
 2. **Typecheck** of the in-scope modules.
@@ -137,7 +167,7 @@ Goal: a typechecking file where the only remaining errors are the `{?}`s represe
    - `arend . <Module>` — that module and its cone.
    - `arend . <Module>:<def>` — one definition.
 
-   With a daemon up (phase 0) these route to it automatically and return in seconds. Resolution and typechecking happen in the same pass, so unresolved references surface as `[ERROR]` alongside genuine type errors. Existing `.arc` caches load unless `-r` is passed, and fresh ones are written back by default. Reach for `-r` only when the binaries are out of sync, typically after a class refactor — and remember it needs `--no-daemon` to have any effect.
+   With a daemon up (phase 0) these route to it automatically and return in seconds. Resolution and typechecking happen in the same pass, so unresolved references surface as `[ERROR]` alongside genuine type errors. Existing `.arc` caches load unless `-r` is passed; fresh ones are written back **only if `--serialize` was given** (on the `-d` bootstrap, for daemon-served calls). Reach for `-r` only when the binaries are out of sync, typically after a class refactor — and remember it needs `--no-daemon` to have any effect, plus `--serialize` to leave a repaired cache behind.
 
 3. **Fix unresolved references by hand.** For each `Cannot resolve reference 'X'`, find the owner with `arend -ss X` — the result is qualified, so it tells you both the name to write and the module to `\import`. When several modules define the same short name, `arend -sc <referable>` dumps the ambient scope at that position and shows which one is actually visible.
 
@@ -239,7 +269,7 @@ Usually `linarith` / `equation` choking on a goal where the implicit algebraic c
 
 ### "Module typechecks cleanly but downstream modules report bogus type mismatches like `Rat` vs `Arith.Rat.Rat`"
 
-Stale binary cache after a class refactor. Only a forced recompile fixes it: `arend --no-daemon -r <module>`. Both flags are needed — a daemon-served `-r` is silently ignored, so without `--no-daemon` you get a warm run that reads the same stale state. Serialization is on by default, so the clean build overwrites the bad `.arc` on its way out and subsequent invocations are both correct and fast.
+Stale binary cache after a class refactor. Only a forced recompile fixes it: `arend --no-daemon -r --serialize <module>`. All three flags are needed — a daemon-served `-r` is silently ignored, so without `--no-daemon` you get a warm run that reads the same stale state; and without `--serialize` the clean build writes no `.arc` at all, so the bad one survives and the next invocation is wrong again.
 
 ### "The daemon insists a definition I can see doesn't resolve"
 
@@ -308,7 +338,7 @@ Treat all of it as the target style *while writing*; Phase 4 is the backstop, no
 
 ## Anti-patterns
 
-- **Passing `--serialize`.** The flag was removed in CLI 1.12 and now hard-errors with `Unrecognized option`. Serialization is on by default; `--no-serialize` is the opt-out and you rarely want it.
+- **Omitting `--serialize` and expecting warm caches.** It is opt-in: without it *no* `.arc` is written, so every run re-typechecks from source and every “forced recompile” fix evaporates. Bootstrap the daemon as `arend . -d --serialize`. (Conversely, do not reach for `--no-serialize` — no such flag.)
 - **Running the whole edit loop without a daemon.** Every call then pays JVM startup plus a full library load. `arend . -d` once at the top of the session is the single largest speedup available.
 - **Expecting `-r` to recompile while a daemon is live.** It is parsed and silently discarded. Write `--no-daemon -r`, or stop the daemon first — otherwise you'll conclude "the recompile didn't fix it" from a run that never recompiled.
 - **Reading `arend-lib/src/*.ard` to find a lemma.** Use `-ss` / `-ps` / `-fu` / `-ch` instead; open sources only once they've told you which module to open.
