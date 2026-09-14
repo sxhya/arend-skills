@@ -133,7 +133,7 @@ Goal: figure out whether the prerequisites already exist, whether someone has al
    - `-ss "glob:Big*<="` for genuine wildcards, `-ss "re:^abs.*"` for raw regex, `-ss "hb:isP"` for camel/dash-fuzzy, `-ss "glob:exact-name"` (no wildcard chars) for an exact match. **The `eq:` mode was removed** — using it now errors out with a fix-it pointing at `glob:`.
    - `limit=N` caps results without piping to `head`.
 
-   `-ss` matches **short names** — `Module.Foo` queries match `Foo`. To find a method on a class, query the bare method name and read the qualified result. See `-ss help` for the full grammar.
+   `-ss` matches **short names** — `Module.Foo` queries match `Foo`. To find a method on a class, query the bare method name and read the qualified result. See `-ss --help` for the full grammar.
 
 4. **Avoid grepping through `arend-lib/src/` at this stage.** Bodies are large, full of metas, and not the part you need to read to decide if something exists. Use the retrieval flags instead — grep is the fallback when you can't phrase the question as a name pattern (`-ss`) or a signature shape (`-ps`).
 
@@ -149,7 +149,7 @@ Goal: pick the right classes, instances, and lemmas as you draft the statement.
 
 2. **`arend -fu <name>`** — find all usages of a definition. Accepts a bare short name (`arend -fu linarith`), a partial qualifier (`Monoid.pow`), or the full `MODULE:DEF` form; ambiguity is reported with the candidate list (`'pow' is ambiguous. Use one of: …`). Use when a definition's *purpose* isn't obvious from its signature (callers' pattern-of-use reveals the role); when checking whether something is used at all before refactoring (`No usages.` is the clear answer); or as a "does this fact exist under some weird name?" probe — `-fu` on a *constant* that MUST appear in the statement of the lemma you're searching for (e.g. `BigSum`, `cabs`, `partialSum`) lists every site mentioning it, so a missing match rules out the lemma's existence.
 
-3. **`arend -ps <pattern>` (proof-search)** — find lemmas by signature shape rather than name. The classic use is "I need commutativity of `+` but I don't know what it's called": `arend -ps "_ + _ = _ + _"`. Pass `-ps help` for the grammar. **Reach for it reflexively whenever you're about to write a stating-shape lemma** — a *negative* result ("No matches") is just as valuable as a hit, since it tells you the helper genuinely doesn't exist and saves you from a wasted lemma signature. Yes, it's slow (~20s on resolution); the information value is high.
+3. **`arend -ps <pattern>` (proof-search)** — find lemmas by signature shape rather than name. The classic use is "I need commutativity of `+` but I don't know what it's called": `arend -ps "_ + _ = _ + _"`. Pass `-ps --help` for the grammar. **Reach for it reflexively whenever you're about to write a stating-shape lemma** — a *negative* result ("No matches") is just as valuable as a hit, since it tells you the helper genuinely doesn't exist and saves you from a wasted lemma signature. Yes, it's slow (~20s on resolution); the information value is high.
 
 These three combine: `-ss` finds candidates, `-ch` tells you the structural context, `-fu` shows you how to use them, `-ps` finds them when you only know the shape.
 
@@ -300,19 +300,47 @@ Daemon poisoning: a transient resolution error (a duplicate name, a half-saved f
 
 ### `-ss` dialect reference
 
-Plain mode is **literal substring on short names** — not regex (Arend identifiers use `*`, `^`, `$`, `?`, `|` freely so these stay literal). Prefixes select other modes:
+**`arend -ss --help` prints the authoritative grammar — run it instead of trusting this table.**
+(`arend -ss help`, no dashes, *searches for the name* "help" and returns real hits; it is an easy
+way to talk yourself into a wrong conclusion. Verified 2026-09-14.) The table below matches the
+build on branch `formalizationProject`.
 
-| Prefix | Meaning |
+Plain mode is **literal substring on short names** — not regex (Arend identifiers use `*`, `^`,
+`$`, `?`, `|` freely, so these stay literal). Prefixes select other modes:
+
+| Pattern | Meaning |
 |---|---|
-| `re:<java-regex>` | Raw regex |
-| `glob:<pat>` | Wildcards (`*`, `?`) |
-| `glob:<text>` (no `*`/`?`) | Exact full *short* name — the old `eq:` mode was removed and now errors |
-| `lit:<text>` | Forced literal (bypasses the regex-look check — use when a real Arend name looks regex-y) |
-| `hb:<chars>` | Humpback / camel-boundary fuzzy |
+| `Foo` | substring, characters literal (`*-comm`, `^-1`, `<*`, `\|\|` all work as typed) |
+| `glob:Foo` | whole-name match; `*` = any run, `?` = one char; `\*` / `\?` for literals |
+| `glob:Foo` (no `*`/`?`) | EXACT short name — the old `eq:` mode was removed and errors with a fix-it |
+| `re:<java-regex>` | Java regex, unanchored (`find()`), case-sensitive as typed |
+| `hb:<chars>` | humpback: word starts / prefixes (`hb:PAM` → `PosetAddMonoid`, `hb:isP` → `isProp`) |
+| `A.B.C` | **long name** — dotted parts of the qualified name; last segment is the short name |
 
-Multi-pattern OR: whitespace inside one `-ss` argument splits into OR'd patterns — `-ss "A B C"` ≡ `-ss A -ss B -ss C`. Multiple `-ss` flags also OR. Filters (extra positional tokens, AND-combined): `contains=<text>` (repeatable substring AND), `kind=func,lemma,...`, `only=lib1,lib2|self`, `case-sensitive`, `limit=N`, `no-cache`.
+**Smart case** (every mode but `re:`): a lowercase letter matches either case, an uppercase letter
+matches uppercase only. So `monoid` finds `Monoid`, but `Monoid` skips a lowercase `monoid`.
 
-Safety nets: a plain pattern containing a regex *sequence* (`.*`, `.+`, `.?`, `(?...`) is rejected with a fix-it; `|` emits a soft warning; a leading apostrophe in an unquoted arg warns about shell-bleed; each run echoes the parsed query so misparses are visible.
+**OR**: multiple patterns are OR'd, and whitespace inside one argument also separates — `-ss "A B C"`
+≡ `-ss A -ss B -ss C`.
+
+**Options**, each its own `-ss` argument: `limit=N` (0 = unlimited, default 200); `kind=k,...` from
+`func sfunc lemma type axiom instance coclause coerce level data cons class record field meta`;
+`self` (restrict to the requested top-level libraries, skipping dependencies).
+
+**There is no `lit:`, `contains=`, `only=`, `case-sensitive` or `no-cache` on this build** — an
+earlier revision of this skill listed all five. Their absence is not benign:
+
+- **An unrecognised token is silently accepted as an extra OR'd pattern**, so a stale filter
+  *widens* the result set instead of narrowing it. `-ss BigSum contains='<='` returns
+  `AddMonoid.BigSum` (no `<=` in the name) and the same 77 matches as bare `BigSum`; `zzz=1` is
+  accepted just as happily. The echoed `Searching for (OR):` block is the only tell — **read it.**
+  For an AND of two substrings there is no filter: use `glob:`/`re:`, or filter the output.
+- **A pattern containing a dot becomes a long-name query**, not a rejected regex. `-ss 'commutator.*'`
+  echoes `long-name 'commutator.*'` and returns `No matches` — there is no "regex sequence rejected
+  with a fix-it" safety net (an earlier revision claimed one). If you typed `.*`, you got a
+  qualified-name search and a silent miss.
+
+Each run echoes the parsed query, so every misparse above is visible in the first two lines of output.
 
 ### Other inspection tools — when they pay off
 

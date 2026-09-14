@@ -219,6 +219,33 @@ The names `Algebra.Meta`, `Paths.Meta`, `Meta`, `Function.Meta` are *virtual* (p
 
     Fix: force the types at the composition site — `p *> inv (q *> pmap (inr {B} {\Sigma}) (unit-eq {t} {u}))`. Spelling `inr`'s implicits solves the metas, and the explicitly-instantiated eta lemma supplies the path. Verified 2026-08-13 on Arend 1.12, `Set/Fin/Subtraction.ard:punch-inv`.
 
+20. **A conditional algebraic identity: `pmap` the hypothesis into a bridging step first; reach for a *pivot identity* only when one step cannot bridge.** `{...}` holds chain step proofs, so the working shape is one line:
+
+    ```arend
+    \lemma comm_conjugate {E : Group} {g h : E} (p : commutator g h = ide) : conjugate g h = h
+      => equation.group {pmap (* h) p}
+    ```
+
+    Read the goal, ask "what context turns `p`'s two sides into my two sides", and `pmap` that context. Five of the six conditional commutator lemmas in `Algebra/Group.ard` are exactly this.
+
+    **The diagnostic when a step does not bridge is actively misleading** — it prints a *normalised* expected type while reporting a search over the *un-normalised* goal, so the subexpression it calls missing is visible in the line beneath it:
+
+    ```
+    [ERROR] Cannot find subexpression
+      Expected type: d * b * c * b^-1 * d^-1 * b * c^-1 * b^-1 = b * d * c * d^-1 * c^-1 * b^-1
+      Subexpression: d * b
+      In: commutator=ide<->comm.1 p
+    ```
+
+    Read that as **"my step does not span a chain position"**, never as "the term is absent". (Same read-as-contradiction shape as failure modes 15 and 18, different cause.) A raw `equation.group {p}` usually fails this way, and the hypothesis merely sitting in the context is ignored outright (`Cannot solve equation`, with `Reduced to:` repeating `Equation:` verbatim).
+
+    **When one step genuinely cannot bridge**, use a pivot: an unconditional `equation.*` restating one side so the hypothesis's LHS surfaces, then `rewrite`/`pmap` with it, then a second solver call. You need this exactly when the relation must be applied at two *interior* positions — decidable in advance, not by trial: compute `RHS⁻¹ · LHS` in the free group and test whether it is a conjugate of the hypothesis's word. If its cyclically reduced length exceeds the hypothesis word's, one step cannot do it. The two live instances are `Algebra/Group.ard:commutator_commutator-right` and `:commutator_conjugate-comm`.
+
+    Two habits that paid off around this:
+
+    - **Find pivots and check statements out of band.** A 20-line free-group reduced-word checker (stack-based cancellation over `[(gen, sign)]`) decides candidate pivots and conjugacy instantly; guessing against `arend` costs a round each and the failures are uninformative. It is also what caught that a *stated* identity was false: `arend-formalization.md`'s proposed `commutator-hall-witt` does not hold in arend-lib's conventions (`commutator g h = g h g⁻¹ h⁻¹`, `conjugate g h = g h g⁻¹`); the correct cyclic form `commutator (commutator a b) (conjugate b c) * commutator (commutator b c) (conjugate c a) * commutator (commutator c a) (conjugate a b) = ide` is a one-line `equation.group`. For *conditional* identities, where a free-group check does not apply, sampling in `S6` is the cheap second opinion.
+    - **Name a flipped hypothesis rather than inlining it.** `comm_sym {g h} (p : commutator g h = ide) : commutator h g = ide => equation.group {pmap inverse p}` is used three times in one 60-line diff.
+
 ### Workflow and language gotchas
 
 - **`\peval` is for `\sfunc` only.** Plain `\func`s reduce by definition; `\peval` on them errors with `Expected a function or an \scase expression`.
@@ -422,6 +449,17 @@ Use `equation` when step proofs are uninteresting. Use `==<` / `>==` / `qed` whe
 
 Existing arend-lib calls (`Algebra/Ring/Localization.ard`, `Algebra/Linear/Matrix.ard`) already pick the correct variant — but `equation` alone is the wrong default for ordered-field arithmetic and the failure message doesn't directly suggest the fix.
 
+**`equation.group` decides group identities, and `{...}` is how you feed it a hypothesis — but the entries are *chain steps*, not assumptions.** The group solver closes any identity that is a word equation in the free group: all eight unconditional `commutator`/`conjugate` identities in `Algebra/Group.ard` (including the full Hall–Witt identity) are a one-line `equation.group`. For a *conditional* identity, `{...}` takes a list of **chain step proofs** — each must bridge two consecutive chain terms, and the solver normalises the gaps shut. With no explicit intermediate terms there is one chain position, so a lone entry must bridge the whole goal. The consequence in practice: **`pmap` the hypothesis into a whole-side bridge and hand that over.**
+
+```arend
+-- p : commutator g h = ide
+=> equation.group {pmap (* (h * g)) p}   -- proves  g * h = h * g
+=> equation.group {pmap (* h) p}         -- proves  conjugate g h = h
+=> equation.group {pmap inverse p}       -- proves  commutator h g = ide
+```
+
+What does *not* work, and is worth recognising fast: a **raw** hypothesis (`equation.group {p}`) unless it happens to bridge, and the hypothesis merely **in the local context** — no `equation.*` solver reads context equations, not even `p : g = h` for the goal `g * g = h * h`. See failure mode 20 for the diagnostic and for the goals that stay out of reach.
+
 ### `cong` — congruence closure
 
 Solves `f x_1 ... x_n = f y_1 ... y_n` given the equalities `x_i = y_i` somewhere in scope. Multi-argument generalization of `pmap`. Note: target type lives in `\Type`, so use `\func` (not `\lemma`).
@@ -526,6 +564,9 @@ Given class `C` with default implementation `F`, plus the explicit arguments `E`
 | Linear (in)equality between sums/products with constants | `linarith` (over `Real`: just `\import Arith.Real.Field`) |
 | Equation between monoid/ring expressions, no commutativity needed | `simplify` |
 | Ring/field identity over `Rat`/`Real` or any commutative ring (needs `*`-commutativity) | `equation.cRing` — **plain `equation` will fail** |
+| Unconditional identity in a group (words in `*`, `inverse`, `ide`) | `equation.group` |
+| Same, but *given* an equational hypothesis `p` | `equation.group {pmap <context> p}` — shape `p` into a whole-side bridge (failure mode 20) |
+| …and no single step can bridge it (relation needed at two interior positions) | pivot identity + `rewrite`/`pmap` + second `equation.group` |
 | Symbolic identity in atoms with `negative`/`natCoef` (e.g. `(A-B) - (A+B) = -2B`) | `equation.cRing` — **`linarith` chokes on `natCoef` vs literal `2`** |
 | Identity over a commutative monoid (no addition) | `equation.cMonoid` |
 | Identity that bridges `finv` / `*-rat` / `fromRat` with CRing rearrangement | `rewrite (finv_*, inv *-rat) equation.cRing` |
@@ -586,18 +627,28 @@ When you're mid-proof and need to find a lemma, a class field, a norm law — th
 
 ### `-ss` dialect prefixes — concrete examples
 
-The default is **case-insensitive substring on short names**, *not* regex. Reaching for `.*` or `.+` means you guessed wrong:
+**`arend -ss --help` is authoritative; run it rather than trusting a table.** (`arend -ss help`,
+no dashes, searches for the *name* "help".) The default is **smart-case substring on short
+names**, not regex — reaching for `.*` means you guessed wrong, and a dot silently turns the
+query into a *qualified-name* search:
 
-| Want | Wrong (guessed regex) | Right |
+| Want | Wrong | Right |
 |---|---|---|
-| Names containing `BigSum` and `<=` | `-ss "BigSum.*<="` | `-ss BigSum contains=<=` |
-| Names containing `midSum` and `rdistr` | `-ss "midSum.*rdistr"` | `-ss midSum contains=rdistr` |
-| Names matching `norm_*_<=` literally | `-ss "norm_*_<="` (works by accident) | `-ss "lit:norm_*_<="` (intent-clear; `eq:` was removed) |
-| Either of two name patterns | `-ss "A\|B"` (shell escape, no-op) | `-ss A -ss B` (multiple flags = OR) |
-| Glob-style wildcard | `-ss "Big*<="` (literal) | `-ss "glob:Big*<="` |
+| Names containing `BigSum` and `<=` | `-ss "BigSum.*<="` (→ long-name query, `No matches`) | `-ss "glob:*BigSum*<=*"`, or filter the output — **there is no `contains=` on this build** |
+| Names matching `norm_*_<=` literally | — | `-ss "norm_*_<="` (plain mode is literal; `*` needs no escaping) |
+| Exact short name | — | `-ss "glob:pmap"` (`glob:` with no wildcard is exact; `eq:` was removed and errors) |
+| Either of two name patterns | `-ss "A\|B"` (literal `\|`, matches nothing) | `-ss A -ss B`, or `-ss "A B"` |
+| Glob wildcard | `-ss "Big*<="` (literal) | `-ss "glob:Big*<="` |
 | Genuine regex | `-ss "^abs.*_+"` (literal) | `-ss "re:^abs.*_\+"` |
+| Method under a given class path | — | `-ss "Monoid.*-comm"` (long name: dotted parts of the qualified name) |
 
-**Rule: if you typed `.*`, `.+`, or `\|` into a `-ss` query, back up and pick a dialect prefix or `contains=`.** Multiple `-ss` flags OR; `contains=` adds AND-substring filters; `limit=N` caps results natively (no need to pipe to `head`).
+Options are separate `-ss` arguments and there are only three: `limit=N` (0 = unlimited,
+default 200), `kind=func,lemma,…`, and `self`. **`lit:`, `contains=`, `only=`,
+`case-sensitive` and `no-cache` do not exist here** — an earlier revision of this skill listed
+them. Worse, **an unrecognised token is silently accepted as an extra OR'd pattern**, so a
+stale filter *widens* the results: `-ss BigSum contains='<='` returns `AddMonoid.BigSum`, whose
+name has no `<=`, and the same count as bare `BigSum`. Every run echoes the parsed query as
+`Searching for (OR): …` — **read those two lines**; they are the only signal.
 
 `-ss` searches **short names only** — `Module.Foo` queries match `Foo`. To find a method on a class, query the bare method name and read the qualified result.
 
